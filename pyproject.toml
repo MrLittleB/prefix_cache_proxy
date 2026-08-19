@@ -1,0 +1,9 @@
+[project]
+name = "prefix-hash-router"
+version = "0.1.0"
+description = "为 vLLM 多 DP 集群实现前缀感知哈希路由（Ingress/Router/Dispatcher 三层架构）"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
