@@ -110,13 +110,19 @@ cp .env.example .env    # 编辑填写真实值
 
 加 `--debug-rank` 后，每次 chat 请求会打印：
 ```
-[route] POST /v1/chat/completions -> rank=0 radix冷启动(fallback) msgs=2
-[route] POST /v1/chat/completions -> rank=0 radix命中 msgs=2          ← 同前缀命中同rank
-[route] POST /v1/chat/completions -> rank=6 radix命中 session='sess-abc' msgs=2
+[route] POST /v1/chat/completions -> rank=3 radix冷启动(完全未命中 walk=0/1) → argmin rank=3 msgs=1
+[route] POST /v1/chat/completions -> rank=0 radix命中(leaf walk=4/4 rank=0) msgs=4  ← 同前缀命中同rank
+[route] POST /v1/chat/completions -> rank=0 radix冷启动(前缀占比≤50% walk=1/2) → argmin rank=0 msgs=2
+[route] POST /v1/chat/completions -> rank=2 radix命中(子树回退 walk=3/4 subtree_rank=2) final-rank=2 msgs=4
+[route] POST /v1/chat/completions -> rank=6 radix命中(leaf walk=1/1 rank=6) session='sess-abc' msgs=1
 [route] GET /v1/models -> 透传(非chat, 不加rank)
 ```
-- `radix冷启动(fallback)`：树里没有该前缀，走了兜底(有会话键 HRW / 无会话键随机+过载感知)，并学习回填
-- `radix命中`：树里已有该前缀归属，命中同 rank
+- `radix冷启动(完全未命中 walk=0/N) → argmin rank=X`：树里没有该前缀，选最闲 rank
+- `radix冷启动(前缀占比≤50% walk=X/Y) → argmin rank=X`：匹配了浅前缀但占比不足，选最闲 rank
+- `radix冷启动(中间断档 walk=X/Y) → argmin rank=X`：深层断档且子树无 rank，选最闲 rank
+- `radix命中(leaf walk=N/N rank=X)`：命中叶子节点 → 过载保护
+- `radix命中(子树回退 walk=X/Y subtree_rank=R) final-rank=X`：walk>50% 子树 BFS 找到 rank → 过载保护
+- `radix命中(末尾追加 walk=X/Y miss=Z rank=A→B)`：对话多轮追加 → 过载保护
 - `session='...'`：命中了会话键（会话粘性最强）
 - 非 chat 请求显示透传
 
@@ -156,15 +162,42 @@ cp .env.example .env    # 编辑填写真实值
 
 ### radix 的关键行为（理解它怎么路由）
 
-radix 树**只在叶子(完整消息序列终点)标记归属 rank**，中间节点(如共享 system/首问)不标：
-- **不同会话**(叶子不同，哪怕共享 system 前几条) → 分散到不同 rank，
-  **各自用独立 DP 的 KV cache，不互相挤占**(解决"每 DP cache 有限、全挤 rank0 互相顶掉")
-- **同一会话多轮**(完整历史命中同一叶子或其延伸) → 粘在同一 rank，命中多轮缓存
-- **同 agent 分支**(如 1-2-3-4 分支出 1-2-3-4-5 和 1-2-3-4-6)：
-  - 若父前缀 1-2-3-4 已被某会话学习过 → 两分支都命中父 rank(vLLM 前缀共享复用 1-2-3-4 缓存)
-  - 若父前缀从未被学过 → 两分支走冷启动兜底，可能分散(需带会话键才能保证一致)
-- 冷启动兜底(RadixFallbackPolicy)：有会话键用 HRW 稳定；无会话键随机打散 + 过载感知
-  (避免顺序轮转局部热点、避免共享 system 塌缩、避免落到过载 DP)
+radix 树在叶子(完整消息序列终点)标记归属 rank，**中间节点 rank 保留不清除**（支持 agent 回溯重发）：
+
+### 完整路由决策树
+
+```
+请求进入
+│
+├─ 第1层: 有 session key? → HRW → 过载保护 → 结束
+│
+├─ 第2层: radix 树查找
+│   ├─ 1. walk=0 完全未命中 → 找最闲rank (argmin load)
+│   ├─ 2. 命中非叶子节点
+│   │   ├─ 2.1 walk/total > 50% → 子树BFS找rank → 过载保护
+│   │   └─ 2.2 walk/total ≤ 50% → 找最闲rank (argmin load)
+│   └─ 3. 命中叶子节点 → found=rank → 过载保护
+│
+├─ 过载保护(命中rank): load < min_load → 直接用; > avg*skew → spill到相对空闲rank
+└─ 找最闲rank(未命中): argmin(load), 多个最闲随机选; 无负载数据 → 随机
+```
+
+| 场景 | 路由策略 |
+|------|----------|
+| **不同会话**(叶子不同，哪怕共享 system) → 分散到不同 rank，各自用独立 DP KV cache |
+| **同一会话多轮**(完整历史命中同一叶子) → 粘在同一 rank，命中多轮缓存 |
+| **Agent 回溯**(从中间节点重新发问) → 命中中间节点保留的 rank，复用 KV cache |
+| **深层分叉**(walk>50% 但非叶子) → 子树回退找 rank → 过载保护 |
+| **浅层共享**(walk≤50%，如只共享 system) → argmin 最闲 rank |
+| **完全未命中**(walk=0) → argmin 最闲 rank |
+
+### LRU 淘汰策略
+
+- 找最旧叶子 → 从叶子向上删 → 遇到以下任一条件停止：
+  - **共享点**(父还有其他孩子) → 停止，保留共享前缀
+  - **有 rank 的节点** → 停止，保护有效短对话/agent 回溯点
+  - **根节点** → 停止
+- 冷的 rank 叶子节点最终也会被淘汰（不会永驻）
 
 ---
 
