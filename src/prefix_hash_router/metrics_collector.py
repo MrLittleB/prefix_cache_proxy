@@ -47,7 +47,7 @@ class MetricsCollector:
     )
 
     def __init__(self, metrics_url: str, dp_size: int = 8,
-                 waiting_weight: float = 4.0, refresh_interval: float = 0.5,
+                 waiting_weight: float = 4.0, refresh_interval: float = 0.2,
                  timeout: float = 10.0, tls_verify: bool = False,
                  auth_token: str | None = None):
         self._url = metrics_url
