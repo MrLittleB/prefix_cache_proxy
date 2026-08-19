@@ -74,7 +74,7 @@ for i in range(100):
     b = r(ctx([msg("user", f"not_in_tree_{i}")]))  # 每次不同消息,避免radix命中
     results.add(b.dp_rank)
 check("完全未命中 + 多个最闲 → 只选最闲的rank", results.issubset({0,1,2,3}), True)
-check("完全未命中 + 多个最闲 → 选最小索引(rank集中)", 0 in results, True)
+check("完全未命中 + 多个最闲 → 多个被选中(随机分散)", len(results) > 1, True)
 
 # 2-1c: 无负载数据 → 随机 (每次用不同消息避免learn-backfill)
 r = build_router(dp_size=8, mode="radix")
@@ -82,7 +82,7 @@ results = set()
 for i in range(50):
     b = r(ctx([msg("user", f"cold_start_{i}")]))
     results.add(b.dp_rank)
-check("完全未命中 + 无负载 → 选rank=0", results == {0}, True)
+check("完全未命中 + 无负载 → 随机分散", len(results) > 1, True)
 
 # ============================================================
 print("\n" + "=" * 60)
