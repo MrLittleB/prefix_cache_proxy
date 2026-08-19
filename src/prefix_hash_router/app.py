@@ -65,7 +65,7 @@ class RadixFallbackPolicy:
     （完全未匹配 / 共享前缀占比 ≤ 50%）。这些请求没有 KV cache 依赖，
     直接分配到最闲 rank 即可，避免空闲 DP 浪费。
 
-    有负载数据时：argmin(load)，多个最闲轮询(round-robin)打破平局。
+    有负载数据时：argmin(load)，多个最闲从轮询游标开始找下一个最闲rank。
     无负载数据时：轮询分配（启动初期的短暂窗口）。
     """
 
@@ -79,8 +79,8 @@ class RadixFallbackPolicy:
         """radix 未命中(完全未匹配 / 共享前缀占比 ≤ 50%)时的冷启动分配。
 
         到达此策略的请求一定无 session key（有的话第一层 SessionAffinity 已处理），
-        也一定 radix 未命中。策略：选最闲 rank（argmin load），多个最闲轮询打破平局；
-        无负载数据时轮询分配。
+        也一定 radix 未命中。策略：选最闲 rank（argmin load），多个最闲从轮询游标
+        找下一个最闲rank；无负载数据时轮询分配。
 
         与"radix 命中"的区别：radix 命中走 OverloadGuard（保护 KV 一致性，
         过载才 spill）；未命中无 KV 依赖，直接填最闲节点即可。
@@ -93,8 +93,12 @@ class RadixFallbackPolicy:
         if load:
             min_load = min(load)
             idle = [i for i in range(len(load)) if load[i] == min_load]
-            self._rr_idx = (self._rr_idx + 1) % len(idle)
-            return Backend(dp_rank=idle[self._rr_idx])
+            # 从轮询游标开始，找idle中最近的rank（跳过非最闲的）
+            for offset in range(self._dp):
+                candidate = (self._rr_idx + offset) % self._dp
+                if candidate in idle:
+                    self._rr_idx = (candidate + 1) % self._dp
+                    return Backend(dp_rank=candidate)
         # 无负载数据：轮询分配
         self._rr_idx = (self._rr_idx + 1) % self._dp
         return Backend(dp_rank=self._rr_idx)
