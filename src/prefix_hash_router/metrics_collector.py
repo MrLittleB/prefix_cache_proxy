@@ -60,6 +60,7 @@ class MetricsCollector:
         self._running = [0.0]*dp_size
         self._waiting = [0.0]*dp_size
         self._has_data = False   # 是否成功解析过至少一次(区分"真实全0"与"从未取到数据")
+        self._consec_fails = 0     # 连续失败次数
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -167,10 +168,16 @@ class MetricsCollector:
             while not self._stop.is_set():
                 try:
                     self.fetch_once()
+                    self._consec_fails = 0  # 成功则重置
                 except Exception as e:
-                    # 拉取失败保留上次值，避免影响路由
+                    # 拉取失败保留上次值，但连续失败3次则清空数据退化为随机
+                    self._consec_fails += 1
                     import sys
-                    sys.stderr.write(f"{time.strftime('[%Y-%m-%d %H:%M:%S]')} [metrics] fetch failed: {e}\n")
+                    sys.stderr.write(f"{time.strftime('[%Y-%m-%d %H:%M:%S]')} [metrics] fetch failed: {e} (consecutive={self._consec_fails})\n")
+                    if self._consec_fails >= 3:
+                        with self._lock:
+                            self._has_data = False
+                        sys.stderr.write(f"{time.strftime('[%Y-%m-%d %H:%M:%S]')} [metrics] 3 consecutive failures, clearing load data (fallback to random)\n")
                 self._stop.wait(self._interval)
         self._thread = threading.Thread(target=_loop, daemon=True)
         self._thread.start()
