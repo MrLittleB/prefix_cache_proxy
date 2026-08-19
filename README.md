@@ -179,7 +179,7 @@ radix 树在叶子(完整消息序列终点)标记归属 rank，**中间节点 r
 │   └─ 3. 命中叶子节点 → found=rank → 过载保护
 │
 ├─ 过载保护(命中rank): load < min_load → 直接用; > avg*skew → spill到相对空闲rank
-└─ 找最闲rank(未命中): argmin(load), 多个最闲随机选; 无负载数据 → 随机
+└─ 找最闲rank(未命中): argmin(load), 多个最闲动态轮询(0→7跳过非最闲); 无负载数据 → 0→7严格轮询
 ```
 
 | 场景 | 路由策略 |
@@ -188,8 +188,23 @@ radix 树在叶子(完整消息序列终点)标记归属 rank，**中间节点 r
 | **同一会话多轮**(完整历史命中同一叶子) → 粘在同一 rank，命中多轮缓存 |
 | **Agent 回溯**(从中间节点重新发问) → 命中中间节点保留的 rank，复用 KV cache |
 | **深层分叉**(walk>50% 但非叶子) → 子树回退找 rank → 过载保护 |
-| **浅层共享**(walk≤50%，如只共享 system) → argmin 最闲 rank |
-| **完全未命中**(walk=0) → argmin 最闲 rank |
+| **浅层共享**(walk≤50%，如只共享 system) → argmin 最闲 rank，动态轮询打破平局 |
+| **完全未命中**(walk=0) → argmin 最闲 rank，动态轮询打破平局 |
+
+### 动态轮询（冷启动/未命中时的负载均衡）
+
+RadixFallbackPolicy 维护 `_rr_idx`（0~dp_size 循环游标），从游标位置开始扫描找下一个最闲 rank：
+- **全 0（冷启动）**：0→1→2→3→4→5→6→7→0 严格轮询，避免 metrics 延迟导致所有请求堆到同一 rank
+- **部分 rank 过载**：跳过非最闲 rank，只轮询最闲子集
+- **仅一个 rank 最闲**：直接分配到该 rank
+
+vs vLLM 内部 LB（`eng_start_index` 轮转）：逻辑本质相同，差异在于代理多了**前缀感知**——同会话请求钉到同 rank，vLLM 内部 LB 不看请求内容会随机打散。
+
+### MetricsCollector 故障降级
+
+- 每 0.2s 轮询 `/metrics` 获取各 DP 的 running/waiting 负载
+- 连续 3 次拉取失败 → `_has_data=False` → `load()` 返回 `None` → 过载保护退化为全放行，路由退化为 0→7 严格轮询
+- vLLM 恢复后自动重新拉取成功 → 恢复过载保护 + argmin 负载均衡
 
 ### LRU 淘汰策略
 
@@ -291,7 +306,8 @@ PYTHONPATH=src python3 tests/live_ab_test.py --with-proxy --proxy-url http://127
 ```bash
 # 全部 8 个测试
 for t in test_router test_dispatcher test_ingress_e2e test_metrics_collector \
-         test_disconnect test_edge_cases test_error test_radix; do
+         test_disconnect test_edge_cases test_error test_radix \
+         test_full_decision_tree test_lru_eviction; do
   PYTHONPATH=src python3 tests/$t.py
 done
 ```
@@ -309,5 +325,7 @@ done
 - ✅ **waiting 渐进权重**：`waiting-weight`(上限,默认4)=第1个2/第2个3/第3个起4，避免小 waiting 被夸大
 - ✅ **`.env` 配置** + 命令行优先（不硬编码真实地址/密钥）
 - ✅ **转发/诊断增强**：`[forward-debug]`(完整地址+body结构) / `[radix-debug]`(命中/断点) / `[overload] SPILL`
-- ✅ 8 个测试文件全部通过
+- ✅ **动态轮询打破平局**：冷启动/未命中时，argmin(load) 的多个最闲 rank 从轮询游标找下一个（0→7 跳过非最闲），避免 metrics 延迟导致请求堆积到同一 rank
+- ✅ **MetricsCollector 故障降级**：连续 3 次拉取失败退化为 0→7 严格轮询 + 过载全放行；vLLM 恢复后自动恢复
+- ✅ 10 个测试文件共 79 项测试全部通过
 - ⏳ 待办：radix 持久化/TTL、多实例共享树(演进)、上游连接池(性能)
